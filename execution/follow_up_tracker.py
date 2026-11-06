@@ -2,12 +2,13 @@
 """
 Follow-Up Tracker — works out which leads are due their next touch, by date.
 
-A lead is only due once enough days have passed since it was last contacted:
-  Contacted   + no reply, 4+ days since Last Contacted   -> Touch 2 (value follow-up)
-  Followed Up + no reply, 10+ days since Last Contacted  -> Touch 3 (soft CTA)
-  Nurture,                30+ days since Last Contacted  -> re-engagement
-Leads with no usable Last Contacted date are listed separately instead of being
-assumed due. Leads that replied, or are Not Contacted or Closed, are never listed.
+Timing comes from the table's "Days Since Last Progress Update" formula (days since
+"Lead Gen Progress" last changed — i.e. since the last touch was logged):
+  Contacted   + no reply, 4+ days   -> Touch 2 (value follow-up)
+  Followed Up + no reply, 10+ days  -> Touch 3 (soft CTA)
+A lead is never listed if it has any reply (Replied, Interested, Not Interested), is
+ticked Ignore or Call Booked, or is Not Contacted or Closed. Leads whose day count is
+blank are listed separately instead of being assumed due.
 
 Nothing is sent. With --generate it drafts the follow-up messages for a person to send.
 
@@ -20,7 +21,7 @@ USAGE:
 import argparse
 import os
 import sys
-from datetime import date, datetime
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -30,61 +31,62 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from execution import airtable_leads  # noqa: E402
 from execution.airtable_leads import (  # noqa: E402
-    F_COMPANY, F_LAST_CONTACTED, F_NAME, F_REPLY, F_ROLE, F_STATUS, F_URL,
-    LEAD_STATUSES, REPLY_STATUSES,
+    F_CALL_BOOKED, F_COMPANY, F_DAYS_SINCE_PROGRESS, F_IGNORE, F_NAME, F_REPLY, F_ROLE,
+    F_STATUS, F_URL, LEAD_STATUSES, REPLY_STATUSES,
 )
 
-# Minimum days since Last Contacted before each follow-up is due.
-TOUCH_TIMING = {'touch_2': 4, 'touch_3': 10, 're_engage': 30}
+# Minimum days since the last progress update before each follow-up is due.
+TOUCH_TIMING = {'touch_2': 4, 'touch_3': 10}
 
 # Which lead status leads to which follow-up. Only canonical statuses appear here.
 FOLLOW_UP_RULES = {
     LEAD_STATUSES['contacted']: 'touch_2',
     LEAD_STATUSES['followed_up']: 'touch_3',
-    LEAD_STATUSES['nurture']: 're_engage',
 }
 
 SECTIONS = [
     ('touch_2', 'Due Touch 2 (value follow-up)'),
     ('touch_3', 'Due Touch 3 (soft CTA)'),
-    ('re_engage', 'Due re-engagement'),
-    ('needs_date', "Can't schedule: no Last Contacted date"),
+    ('needs_date', "Can't schedule: no day count in Airtable"),
 ]
 
 
-def _parse_date(value) -> Optional[date]:
-    if not value:
+def _days(value) -> Optional[int]:
+    if isinstance(value, bool) or value in (None, ''):
         return None
     try:
-        return datetime.strptime(str(value)[:10], '%Y-%m-%d').date()
-    except ValueError:
+        return int(float(value))
+    except (TypeError, ValueError):
         return None
 
 
-def classify_follow_up(fields: Dict, today: date) -> Tuple[Optional[str], str]:
+def classify_follow_up(fields: Dict) -> Tuple[Optional[str], str]:
     """(action, reason) for one Airtable record. action is None when nothing is due."""
-    if fields.get(F_REPLY) == REPLY_STATUSES['replied']:
-        return None, 'replied'
+    reply = fields.get(F_REPLY) or REPLY_STATUSES['no_reply']
+    if reply != REPLY_STATUSES['no_reply']:
+        return None, f'reply: {reply}'
+    if fields.get(F_IGNORE):
+        return None, 'ignored'
+    if fields.get(F_CALL_BOOKED):
+        return None, 'call booked'
     status = fields.get(F_STATUS, '')
     action = FOLLOW_UP_RULES.get(status)
     if not action:
         return None, f'status is {status or "blank"}'
-    last = _parse_date(fields.get(F_LAST_CONTACTED))
-    if last is None:
-        return 'needs_date', 'no usable Last Contacted date'
-    days = (today - last).days
+    days = _days(fields.get(F_DAYS_SINCE_PROGRESS))
+    if days is None:
+        return 'needs_date', 'no day count since the last progress update'
     wait = TOUCH_TIMING[action]
     if days >= wait:
-        return action, f'{days} days since last contact'
+        return action, f'{days} days since the last touch'
     return None, f'{days} of {wait} days'
 
 
-def get_follow_ups(records: List[Dict], today: Optional[date] = None) -> Dict[str, List[Dict]]:
-    today = today or date.today()
+def get_follow_ups(records: List[Dict]) -> Dict[str, List[Dict]]:
     due = {key: [] for key, _ in SECTIONS}
     for record in records:
         fields = record.get('fields', {})
-        action, reason = classify_follow_up(fields, today)
+        action, reason = classify_follow_up(fields)
         if action:
             due[action].append({
                 'id': record.get('id'),
@@ -119,10 +121,10 @@ def format_followup_report(due: Dict[str, List[Dict]], dms: Dict[str, str] = Non
             continue
         lines += [f'## {label}', '']
         if key == 'needs_date':
-            lines += ['*Set "Last Contacted" in Airtable for these, then re-run.*', '']
+            lines += ['*Re-set "Lead Gen Progress" for these in Airtable so the day count starts, then re-run.*', '']
         for lead in due[key]:
             lines += [f"### {lead['name']}",
-                      f"**Title:** {lead['title']}  **Company:** {lead['company']}",
+                      f"**Title:** {lead['title'] or '-'}  **Company:** {lead['company'] or '-'}",
                       f"**LinkedIn:** {lead['linkedin_url'] or 'missing'}",
                       f"**Why:** {lead['reason']}"]
             if dms and lead['id'] in dms:
@@ -149,8 +151,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     dms = {}
     if args.generate:
         from execution.dm_templates import DMSequenceManager, TouchType
-        touch_types = {'touch_2': TouchType.VALUE_FOLLOW_UP, 'touch_3': TouchType.SOFT_CTA,
-                       're_engage': TouchType.RE_ENGAGEMENT}
+        touch_types = {'touch_2': TouchType.VALUE_FOLLOW_UP, 'touch_3': TouchType.SOFT_CTA}
         manager = DMSequenceManager()
         for action, touch_type in touch_types.items():
             for lead in due[action]:

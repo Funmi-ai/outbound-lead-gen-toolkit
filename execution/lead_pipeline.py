@@ -219,14 +219,14 @@ class LeadPipeline:
                 if self.store.add(lead):
                     lead.outcome = 'added'
                     summary.added += 1
-                    seen |= keys
+                    seen |= airtable_leads.without_name_only(keys)
                 else:
                     lead.outcome, lead.note = 'failed', 'Airtable write failed'
                     summary.failed += 1
             else:
                 lead.outcome = 'drafted'
                 summary.drafted_only += 1
-                seen |= keys
+                seen |= airtable_leads.without_name_only(keys)
 
             processed.append(lead)
             if self.pause_seconds and i < len(leads) - 1:
@@ -273,8 +273,8 @@ def generate_outreach_report(leads: List[Lead], summary: RunSummary) -> str:
             f'**Source:** {lead.source}',
             '',
             '### Touch 1: Connection Request (Day 0)', '```', lead.dm_touch1, '```', '',
-            '### Touch 2: Value Follow-Up (Day 4+)', '```', lead.dm_touch2, '```', '',
-            '### Touch 3: Soft CTA (Day 10+ after Touch 2)', '```', lead.dm_touch3, '```', '',
+            '### Touch 2: Value Follow-Up (4+ days after Touch 1)', '```', lead.dm_touch2, '```', '',
+            '### Touch 3: Soft CTA (10+ days after Touch 2)', '```', lead.dm_touch3, '```', '',
         ]
     for label, outcome in (('Skipped as duplicates', 'duplicate'), ('Failed', 'failed')):
         rows = [l for l in leads if l.outcome == outcome]

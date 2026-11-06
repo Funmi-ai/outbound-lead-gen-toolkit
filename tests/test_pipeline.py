@@ -74,7 +74,34 @@ def test_new_leads_are_written_with_canonical_values(tmp_path, fake_airtable):
     for record in fake_airtable.records:
         assert record['fields'][at.F_STATUS] == 'Not Contacted'
         assert record['fields'][at.F_REPLY] == 'No Reply'
-        assert at.F_LAST_CONTACTED not in record['fields']
+
+
+def test_pipeline_works_against_the_live_table_shape(tmp_path, live_airtable):
+    # The live table has no Company field; the original pipeline always sent one.
+    _, summary = run(tmp_path, ROWS, sync=True)
+    assert (summary.added, summary.failed) == (3, 0)
+    assert all(at.F_COMPANY not in r['fields'] for r in live_airtable.records)
+
+
+def test_rerun_against_the_live_table_adds_nothing(tmp_path, live_airtable):
+    # With no stored company, a re-run must still recognise the same people.
+    run(tmp_path, ROWS, sync=True)
+    _, summary = run(tmp_path, ROWS, sync=True)
+    assert (summary.added, summary.duplicates) == (0, 3)
+    assert len(live_airtable.records) == 3
+
+
+def test_company_less_record_matches_a_new_lead_by_name(tmp_path, live_airtable):
+    live_airtable._create({at.F_NAME: 'Blake Sample'})
+    leads, _ = run(tmp_path, ROWS, sync=True)
+    assert leads['Blake Sample'].outcome == 'duplicate'
+
+
+def test_same_name_at_different_companies_in_one_file_are_both_kept(tmp_path, fake_airtable):
+    rows = [{'name': 'Sam Lee', 'title': 'CMO', 'company': 'Contoso'},
+            {'name': 'Sam Lee', 'title': 'VP Marketing', 'company': 'Fabrikam'}]
+    _, summary = run(tmp_path, rows, sync=True)
+    assert (summary.added, summary.duplicates) == (2, 0)
 
 
 # --- Defect 5: dedupe used to be dead code ------------------------------------------------

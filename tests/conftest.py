@@ -8,12 +8,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from execution import airtable_leads  # noqa: E402
-from tests.fakes import FakeAirtable  # noqa: E402
+from tests.fakes import LIVE_SCHEMA, FakeAirtable  # noqa: E402
 
 
 class _NoAirtable:
     def __getattr__(self, name):
-        raise AssertionError('Test reached Airtable without the fake_airtable fixture')
+        raise AssertionError('Test reached Airtable without a fake Airtable fixture')
 
 
 @pytest.fixture(autouse=True)
@@ -22,16 +22,26 @@ def isolated(monkeypatch):
     def blocked(*args, **kwargs):
         raise RuntimeError('Network access is blocked in tests')
     monkeypatch.setattr(socket.socket, 'connect', blocked)
-    for key in ('ANTHROPIC_API_KEY', 'APOLLO_API_KEY', 'LINKEDIN_SESSION_COOKIE'):
+    for key in ('ANTHROPIC_API_KEY', 'APOLLO_API_KEY'):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv('AIRTABLE_API_KEY', 'test-key')
     monkeypatch.setenv('AIRTABLE_BASE_ID', 'appTEST00000000000')
     monkeypatch.setenv('AIRTABLE_TABLE', 'Leads')
     monkeypatch.setattr(airtable_leads, '_session', _NoAirtable())
+    monkeypatch.setattr(airtable_leads, '_FIELD_CACHE', {})
 
 
 @pytest.fixture
 def fake_airtable(monkeypatch):
+    """A table that also has the optional Company field."""
     fake = FakeAirtable()
+    monkeypatch.setattr(airtable_leads, '_session', fake)
+    return fake
+
+
+@pytest.fixture
+def live_airtable(monkeypatch):
+    """A table shaped exactly like the real Leads table (no Company field)."""
+    fake = FakeAirtable(schema=LIVE_SCHEMA)
     monkeypatch.setattr(airtable_leads, '_session', fake)
     return fake

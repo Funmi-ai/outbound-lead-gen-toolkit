@@ -11,16 +11,23 @@ USAGE:
 
 Config (.env): AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE (default "Leads").
 
-Required table fields: Name, LinkedIn URL, Company, Role, Personalised Message,
-Lead Gen Progress (single select, options = LEAD_STATUSES), Reply Status (single
-select, options = REPLY_STATUSES), Last Contacted (date).
+Table fields used:
+  Name, LinkedIn URL, Role, Personalised Message      text
+  Lead Gen Progress                                    single select (LEAD_STATUSES)
+  Reply Status                                         single select (REPLY_STATUSES)
+  Ignore, Call Booked                                  checkboxes
+  Days Since Last Progress Update                      formula:
+      IF({Lead Gen Progress}, DATETIME_DIFF(TODAY(), LAST_MODIFIED_TIME({Lead Gen Progress}), 'days'), BLANK())
+  Company                                              optional text (written only if the table has it)
+
+Writes only include fields the table actually has (checked once per run via the
+Airtable metadata API), so a missing optional field can't make every write fail.
 """
 
 import os
 import re
 import sys
 import unicodedata
-from datetime import date
 from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse
 
@@ -32,24 +39,22 @@ load_dotenv()
 # HTTP layer; tests swap this for an in-memory fake.
 _session = requests
 
-# Canonical status vocabulary. Every module imports these, and the Airtable
-# single-select options must match them exactly.
+# Canonical vocabulary. These match the single-select options in the live Leads table.
 LEAD_STATUSES = {
     'not_contacted': 'Not Contacted',
     'contacted': 'Contacted',        # Touch 1 sent
     'followed_up': 'Followed Up',    # Touch 2 sent
-    'nurture': 'Nurture',            # No reply after the sequence
     'closed': 'Closed',
 }
 REPLY_STATUSES = {
     'no_reply': 'No Reply',
     'replied': 'Replied',
+    'interested': 'Interested',
+    'not_interested': 'Not Interested',
 }
 # Older notes used "Engaged" for a lead that replied.
 STATUS_ALIASES = {'engaged': 'replied'}
 STATUS_ORDER = list(LEAD_STATUSES.values())
-# Moving a lead into one of these records an outbound touch, so it stamps Last Contacted.
-TOUCH_STATUSES = {LEAD_STATUSES['contacted'], LEAD_STATUSES['followed_up']}
 
 F_NAME = 'Name'
 F_URL = 'LinkedIn URL'
@@ -58,12 +63,17 @@ F_ROLE = 'Role'
 F_MESSAGE = 'Personalised Message'
 F_STATUS = 'Lead Gen Progress'
 F_REPLY = 'Reply Status'
-F_LAST_CONTACTED = 'Last Contacted'
+F_IGNORE = 'Ignore'
+F_CALL_BOOKED = 'Call Booked'
+F_DAYS_SINCE_PROGRESS = 'Days Since Last Progress Update'
+REQUIRED_FIELDS = {F_NAME, F_STATUS}
 
 FIELD_ALIASES = {
     'status': F_STATUS, 'reply': F_REPLY, 'dm': F_MESSAGE, 'role': F_ROLE,
-    'name': F_NAME, 'url': F_URL, 'company': F_COMPANY, 'last_contacted': F_LAST_CONTACTED,
+    'name': F_NAME, 'url': F_URL, 'company': F_COMPANY,
 }
+
+_FIELD_CACHE: Dict = {}
 
 
 class AirtableConfigError(RuntimeError):
@@ -74,12 +84,17 @@ class AirtableError(RuntimeError):
     pass
 
 
-def _config():
+def _settings():
     api_key = os.getenv('AIRTABLE_API_KEY')
     base_id = os.getenv('AIRTABLE_BASE_ID')
     table = os.getenv('AIRTABLE_TABLE', 'Leads')
     if not api_key or not base_id:
         raise AirtableConfigError('Set AIRTABLE_API_KEY and AIRTABLE_BASE_ID in .env')
+    return api_key, base_id, table
+
+
+def _config():
+    api_key, base_id, table = _settings()
     url = f'https://api.airtable.com/v0/{base_id}/{table}'
     headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
     return url, headers
@@ -125,9 +140,10 @@ def _norm_company(company: Optional[str]) -> str:
 def prospect_keys(name: str, company: str = '', linkedin_url: str = '', email: str = '') -> Set[str]:
     """Every stable identity we can derive for a prospect.
 
-    Two records are the same prospect if any key matches: the LinkedIn profile slug,
-    the email address, or normalised name + company (so a record saved without a URL
-    still matches the same person later supplied with one).
+    li: LinkedIn profile slug · em: email · nc: name + company · nn: name only.
+    The name-only key is matched only against stored records that have no company
+    (see existing_prospect_keys), so two different people who share a name at
+    different companies aren't merged.
     """
     keys = set()
     url = normalise_linkedin_url(linkedin_url)
@@ -138,7 +154,12 @@ def prospect_keys(name: str, company: str = '', linkedin_url: str = '', email: s
     norm_name = _norm_text(name)
     if norm_name:
         keys.add(f'nc:{norm_name}|{_norm_company(company)}')
+        keys.add(f'nn:{norm_name}')
     return keys
+
+
+def without_name_only(keys: Set[str]) -> Set[str]:
+    return {k for k in keys if not k.startswith('nn:')}
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +180,20 @@ def _quote(value: str) -> str:
     return value.replace('\\', '\\\\').replace('"', '\\"')
 
 
+def table_field_names() -> Optional[Set[str]]:
+    """Field names in the configured table, or None if the metadata API isn't available."""
+    _, base_id, table = _settings()
+    _, headers = _config()
+    if (base_id, table) not in _FIELD_CACHE:
+        try:
+            data = _request('get', f'https://api.airtable.com/v0/meta/bases/{base_id}/tables', headers)
+            match = next((t for t in data.get('tables', []) if table in (t.get('name'), t.get('id'))), None)
+            _FIELD_CACHE[(base_id, table)] = {f['name'] for f in match['fields']} if match else None
+        except AirtableError:
+            _FIELD_CACHE[(base_id, table)] = None
+    return _FIELD_CACHE[(base_id, table)]
+
+
 def list_all_records(filter_formula: Optional[str] = None) -> List[Dict]:
     """Every record in the table (following Airtable's 100-per-page offsets)."""
     url, headers = _config()
@@ -177,11 +212,18 @@ def list_all_records(filter_formula: Optional[str] = None) -> List[Dict]:
 
 
 def existing_prospect_keys() -> Set[str]:
-    """Identity keys for every lead already in Airtable."""
+    """Identity keys for every lead already in Airtable.
+
+    A record saved without a company also contributes its name-only key, so a new
+    lead with the same name is treated as the same person rather than added twice.
+    """
     keys = set()
     for record in list_all_records():
         fields = record.get('fields', {})
-        keys |= prospect_keys(fields.get(F_NAME, ''), fields.get(F_COMPANY, ''), fields.get(F_URL, ''))
+        record_keys = prospect_keys(fields.get(F_NAME, ''), fields.get(F_COMPANY, ''), fields.get(F_URL, ''))
+        if _norm_company(fields.get(F_COMPANY, '')):
+            record_keys = without_name_only(record_keys)
+        keys |= record_keys
     return keys
 
 
@@ -219,8 +261,13 @@ def add_lead(name: str, linkedin_url: str, dm_message: str, status: str = 'Not C
         fields[F_ROLE] = role
     if company:
         fields[F_COMPANY] = company
-    if status in TOUCH_STATUSES:
-        fields[F_LAST_CONTACTED] = date.today().isoformat()
+
+    allowed = table_field_names()
+    if allowed is not None:
+        if not REQUIRED_FIELDS <= allowed:
+            print(f'x The Airtable table is missing required fields: {", ".join(sorted(REQUIRED_FIELDS - allowed))}')
+            return None
+        fields = {k: v for k, v in fields.items() if k in allowed}
 
     try:
         data = _request('post', url, headers, json={'records': [{'fields': fields}]})
@@ -249,8 +296,6 @@ def update_lead(name_search: str, **fields) -> bool:
             print(f'x "{mapped[F_URL]}" is not a LinkedIn profile URL')
             return False
         mapped[F_URL] = clean
-    if mapped.get(F_STATUS) in TOUCH_STATUSES and F_LAST_CONTACTED not in mapped:
-        mapped[F_LAST_CONTACTED] = date.today().isoformat()
 
     try:
         record = find_record(name_search)
@@ -266,7 +311,7 @@ def update_lead(name_search: str, **fields) -> bool:
 
 
 def set_status(name_search: str, status: str) -> bool:
-    """Set a lead's progress (contacted, followed_up, nurture, closed…) or reply status (replied)."""
+    """Set a lead's progress (contacted, followed_up, closed…) or reply status (replied, interested…)."""
     key = status.strip().lower().replace(' ', '_').replace('-', '_')
     key = STATUS_ALIASES.get(key, key)
     if key in LEAD_STATUSES:
@@ -288,12 +333,12 @@ def list_leads(limit: int = 10, status_filter: str = None) -> List[Dict]:
         formula = f'{{{F_STATUS}}} = "{_quote(LEAD_STATUSES.get(key, status_filter))}"'
     records = sorted(list_all_records(formula), key=lambda r: r['fields'].get(F_NAME, ''))[:limit]
 
-    print(f'\n{"Name":<25} {"Role":<20} {"Status":<15} {"Reply":<10}')
-    print('-' * 75)
+    print(f'\n{"Name":<25} {"Role":<20} {"Status":<15} {"Reply":<14}')
+    print('-' * 78)
     for r in records:
         f = r['fields']
         print(f"{f.get(F_NAME, 'Unknown')[:24]:<25} {f.get(F_ROLE, '-')[:19]:<20} "
-              f"{f.get(F_STATUS, '-')[:14]:<15} {f.get(F_REPLY, '-')[:9]:<10}")
+              f"{f.get(F_STATUS, '-')[:14]:<15} {f.get(F_REPLY, '-')[:13]:<14}")
     print()
     return records
 
